@@ -1,14 +1,18 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { LineChart, Line, YAxis, XAxis, ResponsiveContainer, BarChart, Bar, Cell, Tooltip as RechartsTooltip, CartesianGrid, ReferenceLine } from 'recharts';
-import { Activity, Wind, Zap, RefreshCw, Clock, WifiOff } from 'lucide-react';
+import { Activity, Wind, Zap, RefreshCw, Clock, WifiOff, HelpCircle, CalendarDays, Radiation, Sparkles } from 'lucide-react';
 import { AnalysisBox } from './components/AnalysisBox';
 import { InfoTooltip } from './components/InfoTooltip';
 import { SpaceSound } from './components/SpaceSound';
 import { SolarMap } from './components/SolarMap';
 import { GeomagneticMap } from './components/GeomagneticMap';
 import { SolarFlareMap } from './components/SolarFlareMap';
+import { AuroraMap } from './components/AuroraMap';
+import { ProtonGraph } from './components/ProtonGraph';
+import { SDOModal } from './components/SDOModal';
+import { InstallButton } from './components/InstallButton';
 import { fetchSolarData, getFlareClass } from './services/noaaService';
-import { KpDataPoint, WindDataPoint, FlareDataPoint } from './types';
+import { KpDataPoint, WindDataPoint, FlareDataPoint, ForecastDataPoint, ProtonDataPoint } from './types';
 
 // Custom styles for the star background
 const starBgStyle: React.CSSProperties = {
@@ -31,6 +35,29 @@ const formatTime = (isoString: string) => {
     }
 };
 
+const formatShortDate = (isoString: string) => {
+    try {
+        const date = new Date(isoString);
+        return date.toLocaleDateString('ru-RU', { day: 'numeric', month: 'numeric' });
+    } catch (e) {
+        return '';
+    }
+};
+
+const formatFullDate = (isoString: string) => {
+    try {
+        const date = new Date(isoString);
+        return date.toLocaleDateString('ru-RU', { 
+            day: 'numeric', 
+            month: 'numeric', 
+            hour: '2-digit', 
+            minute: '2-digit' 
+        });
+    } catch (e) {
+        return '---';
+    }
+};
+
 // Helper to calculate travel time from Satellite (L1 Point) to Earth
 // Distance L1 to Earth is approx 1.5 million km
 const calculateTravelTimeParts = (speedKmS: number) => {
@@ -46,6 +73,17 @@ const calculateTravelTimeParts = (speedKmS: number) => {
     return { hours, minutes };
 };
 
+// Helper to get average of last N items
+const getAverage = (data: any[], key: string, count: number) => {
+    if (!data || data.length === 0) return 0;
+    const slice = data.slice(-count);
+    const sum = slice.reduce((acc, curr) => acc + (curr[key] || 0), 0);
+    return sum / slice.length;
+};
+
+// Helper for random phrases
+const pick = (options: string[]) => options[Math.floor(Math.random() * options.length)];
+
 interface ExtendedFlare extends FlareDataPoint {
     isSignificant: boolean; 
 }
@@ -55,15 +93,21 @@ const App: React.FC = () => {
   const [kpData, setKpData] = useState<KpDataPoint[]>([]);
   const [windData, setWindData] = useState<WindDataPoint[]>([]);
   const [flareData, setFlareData] = useState<FlareDataPoint[]>([]);
+  const [forecastData, setForecastData] = useState<ForecastDataPoint[]>([]);
+  const [protonData, setProtonData] = useState<ProtonDataPoint[]>([]);
   const [detectedFlares, setDetectedFlares] = useState<ExtendedFlare[]>([]);
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState(false);
-  const [report, setReport] = useState("Инициализация нейросети... Сбор данных...");
+  const [report, setReport] = useState("СИНХРОНИЗАЦИЯ ТЕЛЕМЕТРИИ...");
   const [dangerIndex, setDangerIndex] = useState({ score: 0, label: 'ЗАГРУЗКА...', colorClass: 'text-gray-500' });
   const [activeFlareTime, setActiveFlareTime] = useState<string | null>(null);
+  const [isSDOOpen, setIsSDOOpen] = useState(false);
 
   // Data fetching loop
   const loadData = async () => {
+    // Optimization: Don't fetch if tab is hidden to save resources
+    if (document.hidden) return;
+
     setLoading(true);
     const result = await fetchSolarData();
     
@@ -73,11 +117,12 @@ const App: React.FC = () => {
       setKpData(result.kp);
       setWindData(result.wind);
       setFlareData(result.flares);
-      analyzeData(result.kp, result.wind, result.flares);
+      setForecastData(result.forecast || []);
+      setProtonData(result.protons || []);
+      analyzeData(result.kp, result.wind, result.flares, result.protons || [], result.forecast || []);
       
       // Detect Flares (Peaks)
       const peaks: ExtendedFlare[] = [];
-      // Threshold A1.0 = 1e-8. We want to capture almost all identifiable peaks.
       const threshold = 1e-8; 
       
       for (let i = 1; i < result.flares.length - 1; i++) {
@@ -85,11 +130,8 @@ const App: React.FC = () => {
           const curr = result.flares[i].flux;
           const next = result.flares[i+1].flux;
           
-          // Simple peak detection
           if (curr > prev && curr > next && curr > threshold) {
-              // Significant = Class C1.0 (1e-6) or higher
               const isSignificant = curr >= 1e-6;
-              
               peaks.push({
                   ...result.flares[i],
                   isSignificant: isSignificant
@@ -97,7 +139,6 @@ const App: React.FC = () => {
           }
       }
       
-      // Sort by time descending (newest first)
       const sortedPeaks = peaks.sort((a,b) => new Date(b.time).getTime() - new Date(a.time).getTime());
       setDetectedFlares(sortedPeaks);
     }
@@ -107,96 +148,208 @@ const App: React.FC = () => {
   useEffect(() => {
     loadData();
     const interval = setInterval(loadData, 60000); // Update every minute
-    return () => clearInterval(interval);
+    
+    const handleVisibilityChange = () => {
+        if (!document.hidden) {
+            loadData();
+        }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+        clearInterval(interval);
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   }, []);
 
-  // Analysis Logic
-  const analyzeData = (kp: KpDataPoint[], wind: WindDataPoint[], flares: FlareDataPoint[]) => {
+  // --- ADVANCED ANALYSIS LOGIC ---
+  const analyzeData = (
+      kp: KpDataPoint[], 
+      wind: WindDataPoint[], 
+      flares: FlareDataPoint[], 
+      protons: ProtonDataPoint[],
+      forecast: ForecastDataPoint[]
+  ) => {
+    // 1. DATA SNAPSHOTS
     const lastKp = kp[kp.length - 1]?.kp || 0;
-    const lastWind = wind[wind.length - 1]?.speed || 0;
-    const lastFlareFlux = flares[flares.length - 1]?.flux || 0;
-    const lastFlareClass = getFlareClass(lastFlareFlux);
-
-    // 1. Calculate Danger Index (Score 0-10)
-    let score = 0;
+    const prevKp = kp[kp.length - 2]?.kp || lastKp; // History check
     
-    // KP Impact (Weight 40%)
+    const avgWind = getAverage(wind, 'speed', 6); 
+    const prevWind = getAverage(wind.slice(0, -6), 'speed', 6) || avgWind;
+    
+    const avgFlux = getAverage(flares, 'flux', 12); 
+    const avgProton = getAverage(protons, 'flux', 6);
+    const avgFlareClass = getFlareClass(avgFlux);
+    
+    const nextForecastKp = forecast.length > 1 ? forecast[1].kp : lastKp;
+
+    // 2. DANGER SCORE CALC
+    let score = 0;
     if (lastKp >= 7) score += 4;
     else if (lastKp >= 5) score += 3;
     else if (lastKp >= 4) score += 2;
     else if (lastKp >= 3) score += 1;
 
-    // Wind Impact (Weight 30%)
-    if (lastWind >= 700) score += 3;
-    else if (lastWind >= 500) score += 2;
-    else if (lastWind >= 400) score += 1;
+    if (avgWind >= 700) score += 3;
+    else if (avgWind >= 500) score += 2;
+    else if (avgWind >= 400) score += 1;
 
-    // Flare Impact (Weight 30%)
-    if (lastFlareClass.includes('X')) score += 3;
-    else if (lastFlareClass.includes('M')) {
-       const val = parseFloat(lastFlareClass.replace('M', ''));
+    if (avgFlareClass.includes('X')) score += 3;
+    else if (avgFlareClass.includes('M')) {
+       const val = parseFloat(avgFlareClass.replace('M', ''));
        if (val >= 5) score += 2;
        else score += 1;
     }
 
-    // Determine Level
-    let dLabel = 'НИЗКИЙ';
-    let dColor = 'text-[#00e676]'; // Green
-
-    if (score >= 5) {
-        dLabel = 'КРИТИЧЕСКИЙ';
-        dColor = 'text-[#ff1744]'; // Red
-    } else if (score >= 3) {
-        dLabel = 'ПОВЫШЕННЫЙ';
-        dColor = 'text-[#ffca28]'; // Yellow
-    }
+    let dLabel = 'ФОНОВЫЙ';
+    let dColor = 'text-[#00e676]'; 
+    if (score >= 5) { dLabel = 'ВЫСОКИЙ'; dColor = 'text-[#ff1744]'; } 
+    else if (score >= 3) { dLabel = 'УМЕРЕННЫЙ'; dColor = 'text-[#ffca28]'; }
 
     setDangerIndex({ score, label: dLabel, colorClass: dColor });
 
-    // 2. Generate Text Report
-    let text = [];
+    const parts = [];
 
-    // Kp Analysis
-    if (lastKp >= 5) text.push("ВНИМАНИЕ: ЗАФИКСИРОВАНА МАГНИТНАЯ БУРЯ. Возможны сбои в работе спутников и GPS.");
-    else if (lastKp >= 3) text.push("СОСТОЯНИЕ: Магнитосфера в возбужденном состоянии. Метеозависимым приготовиться.");
-    else text.push("СОСТОЯНИЕ: Геомагнитная обстановка спокойная. Угроз не выявлено.");
+    // --- SECTION 1: STATUS & TREND (Geomagnetic) ---
+    let statusText = "";
+    
+    // Determine Trend (Rising, Falling, Stable)
+    const kpTrend = lastKp - prevKp;
+    let trendDesc = "";
+    if (kpTrend > 0) trendDesc = "наблюдается тенденция к усилению возмущений.";
+    else if (kpTrend < 0) trendDesc = "фиксируется спад активности.";
+    else trendDesc = "ситуация стабильна.";
 
-    // Wind Analysis
-    if (lastWind > 600) text.push(`\nСкорость солнечного ветра экстремальная (${Math.round(lastWind)} км/с).`);
-    else if (lastWind > 450) text.push(`\nПоток плазмы ускорен (${Math.round(lastWind)} км/с).`);
-    else text.push(`\nСолнечный ветер в норме (${Math.round(lastWind)} км/с).`);
+    if (lastKp >= 7) {
+        statusText = `СТАТУС: Сильная магнитная буря (G3). ${pick(["Порог стабильности значительно превышен.", "Геомагнитное поле испытывает сильную нагрузку."])} ${trendDesc} В средних широтах возможны яркие полярные сияния.`;
+    } else if (lastKp >= 5) {
+        statusText = `СТАТУС: Умеренная магнитная буря (G1-G2). ${pick(["Порог геомагнитной стабильности превышен.", "Магнитосфера находится в активной фазе сопротивления."])} ${trendDesc} Это штатный режим работы планетарной защиты.`;
+    } else if (lastKp >= 4) {
+        statusText = `СТАТУС: Возбужденное состояние магнитосферы (K-index 4). ${pick(["Активность приближается к порогу магнитной бури.", "Фиксируются повышенные флуктуации поля."])} ${trendDesc} Критический порог (G1) на данный момент не преодолен.`;
+    } else if (lastKp >= 3) {
+        statusText = `СТАТУС: Неустойчивое геомагнитное поле. ${pick(["Наблюдаются незначительные возмущения.", "Вариант нормы с легкой нестабильностью."])} ${trendDesc} Обстановка благоприятная.`;
+    } else {
+        statusText = `СТАТУС: ${pick(["Геомагнитный штиль.", "Спокойная геомагнитная обстановка.", "Магнитосфера в состоянии покоя."])} Поле стабильно, возмущений не зарегистрировано. Идеальные условия.`;
+    }
+    parts.push(statusText);
 
-    // Flare Analysis
-    if (lastFlareClass.includes('X')) text.push("\nРАДИАЦИОННАЯ ТРЕВОГА: Вспышка класса X. Риск отключения радиосвязи.");
-    else if (lastFlareClass.includes('M')) text.push("\nВысокая вспышечная активность (Класс M).");
-    else text.push("\nРентгеновское излучение Солнца фоновое.");
+    // --- SECTION 2: DYNAMICS (Wind Analysis & Origin) ---
+    let dynText = "";
+    const windDiff = avgWind - prevWind;
+    let windTrend = "";
+    if (windDiff > 50) windTrend = "Скорость потока резко растет (приход ударной волны).";
+    else if (windDiff < -50) windTrend = "Скорость ветра снижается.";
+    else windTrend = "Скорость потока стабильна.";
 
-    setReport(text.join(" "));
+    if (avgWind >= 500) {
+        // Distinguish source: CH HSS vs CME
+        // Logic: CH usually low protons. CME often high protons.
+        const sourceNote = avgProton < 10 
+            ? "Ветер усилен, но радиационный фон в норме — признак высокоскоростного потока из корональной дыры (CH HSS)." 
+            : "Высокая скорость ветра сопровождается ростом протонного фона — вероятно воздействие выброса корональной массы (CME).";
+
+        if (lastKp < 4) {
+             dynText = `ДИНАМИКА: ${sourceNote} ${windTrend} Несмотря на высокие значения скорости (${Math.round(avgWind)} км/с), текущая конфигурация магнитного поля (Bz North) эффективно блокирует передачу энергии.`;
+        } else {
+             dynText = `ДИНАМИКА: ${sourceNote} ${windTrend} Поток плазмы (${Math.round(avgWind)} км/с) оказывает давление на магнитосферу, поддерживая активность.`;
+        }
+    } 
+    else {
+        dynText = `ДИНАМИКА: Параметры солнечного ветра (скорость ${Math.round(avgWind)} км/с, плотность ${windData[windData.length-1]?.density.toFixed(1)}) находятся в значениях, близких к фоновым. ${windTrend}`;
+    }
+    parts.push(dynText);
+
+    // --- SECTION 3: FORECAST (Predictive Analysis) ---
+    let forecastText = "";
+    if (nextForecastKp > lastKp) {
+        forecastText = `ПРОГНОЗ: Модель NOAA прогнозирует ${pick(["усиление геомагнитной активности", "рост Kp-индекса"])} в ближайшие 3-6 часов.`;
+    } else if (nextForecastKp < lastKp && lastKp >= 4) {
+        forecastText = `ПРОГНОЗ: Ожидается ${pick(["стабилизация обстановки", "постепенное снижение активности", "затухание возмущений"])} в ближайшие часы.`;
+    } else {
+        forecastText = `ПРОГНОЗ: Согласно моделям, существенных изменений не предвидится. Сохранение текущего тренда.`;
+    }
+    parts.push(forecastText);
+
+    // --- SECTION 4: PHYSICS & RADIATION ---
+    let physText = "";
+    if (avgFlareClass.includes('X')) {
+        physText = "ФИЗИКА: Внимание! Зарегистрирован мощный рентгеновский всплеск (Класс X). Возможны краткосрочные перебои КВ-радиосвязи на дневной стороне Земли. Радиационная угроза для поверхности отсутствует.";
+    } else if (avgProton >= 10) {
+        physText = `ФИЗИКА: Фиксируется протонное событие (S-Scale). Поток частиц высоких энергий повышен (${protonData[protonData.length-1]?.flux.toFixed(0)} pfu). Влияние ограничено космическими аппаратами и полярными трассами.`;
+    } else {
+        physText = "ФИЗИКА: Рентгеновское и протонное излучение Солнца находится на минимальных значениях (Фон). Радиационная обстановка в норме.";
+    }
+    parts.push(physText);
+
+    setReport(parts.join("\n\n"));
   };
 
   // Current Values
   const currentKp = kpData[kpData.length - 1]?.kp || 0;
+  const lastKpTime = kpData.length > 0 ? formatFullDate(kpData[kpData.length-1].time) : "---";
+
   const currentWind = windData[windData.length - 1]?.speed || 0;
   const currentDensity = windData[windData.length - 1]?.density || 0;
+  const lastWindTime = windData.length > 0 ? formatFullDate(windData[windData.length-1].time) : "---";
+
   const currentFlareClass = flareData[flareData.length - 1]?.class || "A0.0";
   const currentFlareFlux = flareData[flareData.length - 1]?.flux || 0;
+  const lastFlareTime = flareData.length > 0 ? formatFullDate(flareData[flareData.length-1].time) : "---";
+  
   const isFlareHigh = currentFlareClass.includes('M') || currentFlareClass.includes('X');
 
   const travelInfo = calculateTravelTimeParts(currentWind);
 
-  // Filter list: Show ONLY Significant Flares in list (C1.0+)
+  const logFlux = Math.log10(currentFlareFlux || 1e-8);
+  const activeZonesCount = Math.max(2, Math.min(8, Math.floor((logFlux + 8) * 2)));
+  
+  let intensityDesc = "НИЗКАЯ";
+  if (currentFlareClass.includes('M')) intensityDesc = "УМЕРЕННАЯ";
+  if (currentFlareClass.includes('X')) intensityDesc = "ВЫСОКАЯ";
+
   const significantFlaresList = detectedFlares.filter(f => f.isSignificant);
+
+  // Proton Logic
+  const currentProtonFlux = protonData[protonData.length - 1]?.flux || 0;
+  // S-Scale: S1 > 10, S2 > 100, S3 > 1000
+  let protonScale = "S0 (Фон)";
+  let protonColor = "text-green-400";
+  if (currentProtonFlux >= 100000) { protonScale = "S5 (Экстремально)"; protonColor = "text-red-600"; }
+  else if (currentProtonFlux >= 10000) { protonScale = "S4 (Жесткий)"; protonColor = "text-red-500"; }
+  else if (currentProtonFlux >= 1000) { protonScale = "S3 (Сильный)"; protonColor = "text-red-400"; }
+  else if (currentProtonFlux >= 100) { protonScale = "S2 (Умеренный)"; protonColor = "text-yellow-400"; }
+  else if (currentProtonFlux >= 10) { protonScale = "S1 (Слабый)"; protonColor = "text-yellow-200"; }
+
+  // --- SCIENTIFIC SOURCE DETECTION ---
+  const isHighWind = currentWind > 500;
+  const isProtonStorm = currentProtonFlux >= 10;
+
+  const isCoronalHoleSource = isHighWind && !isProtonStorm;
+  const isCMESource = isHighWind && isProtonStorm;
+
+  // --- AURORA TEXT ---
+  let auroraProbText = "Вероятность только в полярных широтах.";
+  let auroraLocations = "Шпицберген, Северная Земля";
+  if (currentKp >= 3) { auroraProbText = "Возможно наблюдение в высоких широтах."; auroraLocations = "Мурманск, Тромсё, Рейкьявик"; }
+  if (currentKp >= 5) { auroraProbText = "Высокая вероятность в средних широтах."; auroraLocations = "Санкт-Петербург, Хельсинки, Осло, Минск"; }
+  if (currentKp >= 7) { auroraProbText = "Экстремальная видимость. Южные регионы."; auroraLocations = "Москва, Казань, Берлин, Минск"; }
 
   return (
     <div style={starBgStyle} className="min-h-screen p-4 md:p-8 text-gray-100 selection:bg-cyan-500 selection:text-white">
       
-      <header className="max-w-7xl mx-auto mb-8 pb-4 border-b border-white/10 flex flex-col md:flex-row justify-between items-center gap-4">
+      <SDOModal isOpen={isSDOOpen} onClose={() => setIsSDOOpen(false)} />
+      <InstallButton />
+
+      <header className="max-w-2xl mx-auto mb-8 pb-4 border-b border-white/10 flex flex-col md:flex-row justify-between items-center gap-4">
         <div className="text-center md:text-left">
           <h1 className="text-3xl md:text-4xl font-bold uppercase tracking-[0.2em] flex items-center gap-4 drop-shadow-[0_0_15px_rgba(0,188,212,0.4)]">
             Solar Monitor
             <span className={`inline-block w-3 h-3 rounded-full shadow-[0_0_10px] animate-pulse ${loading ? 'bg-yellow-400 shadow-yellow-400' : fetchError ? 'bg-red-500 shadow-red-500' : 'bg-[#00e676] shadow-[#00e676]'}`}></span>
           </h1>
-          <div className="text-gray-500 text-sm font-mono mt-1 tracking-widest">LIVE TELEMETRY // NOAA SWPC DATA STREAM</div>
+          <div className="flex items-center gap-3 text-gray-500 text-sm font-mono mt-1 tracking-widest">
+            <span>LIVE TELEMETRY // NOAA SWPC DATA STREAM</span>
+            <span className="px-1.5 py-0.5 rounded bg-white/5 border border-white/10 text-[10px]">v3.0</span>
+          </div>
         </div>
         
         <div className="flex flex-col md:flex-row items-center gap-3">
@@ -208,15 +361,14 @@ const App: React.FC = () => {
                 flareFlux={currentFlareFlux}
             />
             
-            <button onClick={loadData} className="flex items-center gap-2 px-4 py-2 border border-[#00bcd4] text-[#00bcd4] rounded hover:bg-[#00bcd4] hover:text-black transition-all uppercase text-xs font-bold tracking-wider h-[34px]">
-              <RefreshCw size={14} className="animate-spin-slow" /> Обновить
+            <button onClick={() => !loading && loadData()} className="flex items-center gap-2 px-4 py-2 border border-[#00bcd4] text-[#00bcd4] rounded hover:bg-[#00bcd4] hover:text-black transition-all uppercase text-xs font-bold tracking-wider h-[34px]">
+              <RefreshCw size={14} className={loading ? "animate-spin" : ""} /> Обновить
             </button>
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto">
+      <main className="max-w-2xl mx-auto">
         
-        {/* CONNECTION ERROR BANNER */}
         {fetchError && (
             <div className="mb-6 bg-red-900/50 border border-red-500 text-red-100 px-6 py-4 rounded shadow-[0_0_20px_rgba(255,23,68,0.3)] flex items-center gap-4 animate-pulse">
                 <WifiOff size={32} className="text-red-500" />
@@ -229,12 +381,7 @@ const App: React.FC = () => {
 
         <AnalysisBox text={report} danger={dangerIndex} />
 
-        {/* 
-           LAYOUT CHANGE: 
-           Using flex-col to stack cards horizontally (one below another) 
-           even on large screens, as requested.
-        */}
-        <div className="flex flex-col gap-6">
+        <div className="flex flex-col gap-8">
           
           {/* --- CARD 1: KP INDEX --- */}
           <div className="bg-[#10141e]/90 border border-white/10 rounded-lg p-6 shadow-2xl hover:border-white/30 transition-colors duration-300 flex flex-col">
@@ -244,13 +391,15 @@ const App: React.FC = () => {
               </h3>
               <InfoTooltip 
                 title="Kp-Index (Планетарный)"
+                source="NOAA SWPC / GFZ"
+                lastUpdate={lastKpTime}
                 description={
                   <>
-                    <p>Показатель геомагнитной активности Земли.</p>
+                    <p>Глобальный индекс геомагнитной активности.</p>
                     <ul className="mt-2 list-disc list-inside space-y-1">
-                      <li><span className="text-green-400">0-3</span>: Спокойно (Норма)</li>
-                      <li><span className="text-yellow-400">4</span>: Возмущение (Внимание)</li>
-                      <li><span className="text-red-500">5-9</span>: <strong className="text-red-400">Магнитная буря</strong> (Шторм)</li>
+                      <li><span className="text-green-400">0-3</span>: Спокойное поле</li>
+                      <li><span className="text-yellow-400">4</span>: Возмущенное поле</li>
+                      <li><span className="text-red-500">5-9</span>: <span className="text-red-400">Магнитная буря</span></li>
                     </ul>
                   </>
                 }
@@ -262,16 +411,14 @@ const App: React.FC = () => {
                 {currentKp.toFixed(1)}
               </span>
               <div className="mb-2 px-2 py-1 bg-white/10 rounded text-xs text-gray-300">
-                {currentKp >= 5 ? 'БУРЯ' : currentKp >= 4 ? 'Активно' : 'Спокойно'}
+                {currentKp >= 5 ? 'БУРЯ' : currentKp >= 4 ? 'Возбуждение' : 'Спокойно'}
               </div>
             </div>
 
-             {/* VISUALIZATION */}
             <GeomagneticMap kp={currentKp} windSpeed={currentWind} density={currentDensity} />
 
-            {/* Chart with fixed height for stacked layout */}
-            <div className="bg-black/20 rounded border border-white/5 p-2 relative h-[300px]">
-              <ResponsiveContainer width="100%" height="100%">
+            <div className="h-[160px] bg-black/20 rounded border border-white/5 p-2 relative">
+              <ResponsiveContainer width="100%" height="100%" minWidth={0}>
                 <BarChart data={kpData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(255,255,255,0.1)" />
                   <XAxis 
@@ -306,7 +453,84 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          {/* --- CARD 2: SOLAR WIND --- */}
+          {/* --- CARD 2: 3-DAY FORECAST --- */}
+          <div className="bg-[#10141e]/90 border border-white/10 rounded-lg p-6 shadow-2xl hover:border-white/30 transition-colors duration-300 flex flex-col">
+            <div className="flex justify-between items-start mb-4">
+              <h3 className="text-gray-400 text-sm font-bold tracking-widest flex items-center gap-2">
+                <CalendarDays size={16} /> ПРОГНОЗ ГЕОМАГНИТНЫХ БУРЬ
+              </h3>
+              <InfoTooltip 
+                title="Forecast (Прогноз Kp)"
+                source="NOAA SWPC (Model)"
+                description={
+                  <>
+                    <p>Прогноз геомагнитной активности на ближайшие 3 дня.</p>
+                    <p className="mt-2 text-xs text-gray-400">Столбцы показывают ожидаемый Kp-индекс с интервалом в 3 часа.</p>
+                  </>
+                }
+              />
+            </div>
+
+            <div className="h-[160px] bg-black/20 rounded border border-white/5 p-2 relative">
+              {forecastData.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%" minWidth={0}>
+                    <BarChart data={forecastData} margin={{ top: 27, right: 10, left: 0, bottom: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(255,255,255,0.1)" />
+                      <XAxis 
+                        dataKey="time" 
+                        tickFormatter={formatShortDate} 
+                        tick={{ fill: '#6b7280', fontSize: 10 }} 
+                        axisLine={false}
+                        tickLine={false}
+                        minTickGap={30}
+                      />
+                      <YAxis 
+                        domain={[0, 9]} 
+                        tick={{ fill: '#6b7280', fontSize: 10 }}
+                        axisLine={false}
+                        tickLine={false}
+                        width={20}
+                      />
+                      <RechartsTooltip 
+                        cursor={{ fill: 'rgba(255, 255, 255, 0.05)' }}
+                        contentStyle={{ backgroundColor: '#151a25', borderColor: '#00bcd4', color: '#fff', borderRadius: '4px' }}
+                        itemStyle={{ color: '#00bcd4' }}
+                        labelFormatter={(label) => `${formatShortDate(label)} ${formatTime(label)}`}
+                        formatter={(value: number) => [`Kp: ${value}`, 'Прогноз']}
+                      />
+                      <Bar dataKey="kp" radius={[2, 2, 0, 0]}>
+                        {forecastData.map((entry, index) => (
+                          <Cell 
+                            key={`cell-${index}`} 
+                            fill={index === 0 ? '#ffffff' : (entry.kp >= 5 ? '#ff1744' : entry.kp >= 4 ? '#ffca28' : '#4fc3f7')} 
+                          />
+                        ))}
+                      </Bar>
+                      
+                      <ReferenceLine 
+                        x={forecastData[0].time} 
+                        stroke="none" 
+                        label={{ 
+                            position: 'top', 
+                            value: 'СЕЙЧАС', 
+                            fill: '#ffffff', 
+                            fontSize: 10, 
+                            fontWeight: 'bold',
+                            dy: -10,
+                            className: "animate-pulse"
+                        }} 
+                      />
+                    </BarChart>
+                  </ResponsiveContainer>
+              ) : (
+                  <div className="flex items-center justify-center h-full text-gray-500 text-xs font-mono">
+                      ДАННЫЕ ПРОГНОЗА НЕДОСТУПНЫ
+                  </div>
+              )}
+            </div>
+          </div>
+
+          {/* --- CARD 3: SOLAR WIND --- */}
           <div className="bg-[#10141e]/90 border border-white/10 rounded-lg p-6 shadow-2xl hover:border-white/30 transition-colors duration-300 flex flex-col">
             <div className="flex justify-between items-start mb-4">
               <h3 className="text-gray-400 text-sm font-bold tracking-widest flex items-center gap-2">
@@ -314,20 +538,21 @@ const App: React.FC = () => {
               </h3>
               <InfoTooltip 
                 title="Solar Wind Speed"
+                source="DSCOVR (L1 Orbit)"
+                lastUpdate={lastWindTime}
                 description={
                   <>
-                    <p>Скорость потока частиц от Солнца к Земле.</p>
+                    <p>Скорость потока частиц от Солнца.</p>
                     <ul className="mt-2 list-disc list-inside space-y-1">
-                      <li><span className="text-green-400">300-400 км/с</span>: Норма</li>
-                      <li><span className="text-yellow-400">&gt;500 км/с</span>: Высокая скорость</li>
-                      <li><span className="text-red-500">&gt;700 км/с</span>: <strong className="text-red-400">Ударная волна</strong></li>
+                      <li><span className="text-green-400">300-400 км/с</span>: Обычный поток</li>
+                      <li><span className="text-yellow-400">&gt;500 км/с</span>: Скоростной поток</li>
+                      <li><span className="text-red-500">&gt;700 км/с</span>: <span className="text-red-400">Высокоскоростной</span></li>
                     </ul>
                   </>
                 }
               />
             </div>
 
-            {/* COMPACT DATA ROW: SPEED + TIME */}
             <div className="flex justify-between items-end mb-4 border-b border-gray-800 pb-4">
                <div>
                    <div className="text-gray-500 text-[9px] uppercase tracking-widest mb-1">Скорость потока</div>
@@ -341,7 +566,10 @@ const App: React.FC = () => {
                <div className="text-right">
                    <div className="text-gray-500 text-[9px] uppercase tracking-widest mb-1 flex items-center justify-end gap-1">
                         Прилет от L1 (DSCOVR)
-                        <InfoTooltip title="Время прилета" description="Спутник DSCOVR находится в точке L1 (1.5 млн км от Земли). Это время, за которое солнечный ветер, зафиксированный спутником прямо сейчас, достигнет Земли." />
+                        <InfoTooltip 
+                            title="Время прилета" 
+                            description="Спутник DSCOVR находится в точке L1 (1.5 млн км от Земли). Это расчетное время, за которое солнечный ветер, зафиксированный спутником, достигнет магнитосферы Земли при текущей скорости." 
+                        />
                    </div>
                    <div className="flex items-center justify-end gap-2 font-mono text-[#00bcd4]">
                         <Clock size={18} />
@@ -358,13 +586,11 @@ const App: React.FC = () => {
                 </div>
             </div>
 
-            {/* SOLAR MAP VISUALIZATION */}
             <SolarMap speed={currentWind} density={currentDensity} kp={currentKp} />
 
-            {/* Interactive Chart with Fixed Height */}
-            <div className="bg-black/20 rounded border border-white/5 p-2 h-[300px]">
-               <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={windData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+            <div className="h-[160px] bg-black/20 rounded border border-white/5 p-2">
+               <ResponsiveContainer width="100%" height="100%" minWidth={0}>
+                <LineChart data={windData} margin={{ top: 10, right: 35, left: 0, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(255,255,255,0.1)" />
                   <XAxis 
                     dataKey="time" 
@@ -381,10 +607,24 @@ const App: React.FC = () => {
                     tickLine={false}
                     width={35}
                   />
+                  
+                  <ReferenceLine 
+                    y={500} 
+                    stroke="#ffca28" 
+                    strokeDasharray="3 3" 
+                    label={{ position: 'right', value: 'FAST', fill: '#ffca28', fontSize: 9 }} 
+                  />
+                  <ReferenceLine 
+                    y={700} 
+                    stroke="#ff1744" 
+                    strokeDasharray="3 3" 
+                    label={{ position: 'right', value: 'STORM', fill: '#ff1744', fontSize: 9 }} 
+                  />
+
                   <RechartsTooltip 
                      contentStyle={{ backgroundColor: '#151a25', borderColor: '#00bcd4', color: '#fff', borderRadius: '4px' }}
                      labelFormatter={(label) => formatTime(label)}
-                     formatter={(value: number) => [`${Math.round(value)} км/с`, 'Скорость']}
+                     formatter={(value: number, _name: string, _props: any) => [`${Math.round(value)} км/с`, 'Скорость']}
                   />
                   <Line 
                     type="monotone" 
@@ -399,7 +639,7 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          {/* --- CARD 3: FLARES --- */}
+          {/* --- CARD 4: FLARES --- */}
           <div className="bg-[#10141e]/90 border border-white/10 rounded-lg p-6 shadow-2xl hover:border-white/30 transition-colors duration-300 flex flex-col">
             <div className="flex justify-between items-start mb-4">
               <h3 className="text-gray-400 text-sm font-bold tracking-widest flex items-center gap-2">
@@ -407,34 +647,75 @@ const App: React.FC = () => {
               </h3>
               <InfoTooltip 
                 title="Solar Flares (Вспышки)"
+                source="GOES-16/18 (Sat)"
+                lastUpdate={lastFlareTime}
                 description={
                   <>
-                    <p>Мощные выбросы энергии на Солнце (Рентген).</p>
+                    <p>Импульсные всплески излучения.</p>
                     <ul className="mt-2 list-disc list-inside space-y-1">
-                      <li><span className="text-green-400">A, B, C</span>: Обычная активность</li>
-                      <li><span className="text-yellow-400">M</span>: Средние вспышки (Радиопомехи)</li>
-                      <li><span className="text-red-500">X</span>: <strong className="text-red-400">Опасные</strong> (Радиация)</li>
+                      <li><span className="text-green-400">A, B, C</span>: Базовый уровень</li>
+                      <li><span className="text-yellow-400">M</span>: Умеренные вспышки</li>
+                      <li><span className="text-red-500">X</span>: <span className="text-red-400">Мощные вспышки</span></li>
                     </ul>
                   </>
                 }
               />
             </div>
 
-            <div className="flex items-end gap-2 mb-4">
-              <span className={`font-mono text-5xl leading-none drop-shadow-md ${isFlareHigh ? 'text-[#ff1744]' : 'text-white'}`}>
-                {currentFlareClass}
-              </span>
-              <div className="mb-2 px-2 py-1 bg-white/10 rounded text-xs text-gray-300">
-                 {isFlareHigh ? 'АКТИВНОСТЬ' : 'Фон'}
-              </div>
+            <div className="flex items-center justify-between mb-4 border-b border-white/5 pb-4">
+                <div className="flex items-end gap-3">
+                    <span className={`font-mono text-5xl leading-none drop-shadow-md ${isFlareHigh ? 'text-[#ff1744]' : 'text-white'}`}>
+                        {currentFlareClass}
+                    </span>
+                    <div className="mb-1 px-2 py-0.5 bg-white/10 rounded text-[10px] text-gray-400 uppercase tracking-wider font-bold">
+                        {isFlareHigh ? 'АКТИВНОСТЬ' : 'Фон'}
+                    </div>
+                </div>
+                
+                <div className="text-right flex flex-col gap-1 text-[10px] font-mono text-gray-400">
+                    <div className="flex items-center justify-end gap-2">
+                        <span>АКТИВНЫЕ ЗОНЫ:</span>
+                        <span className="text-white font-bold">{activeZonesCount}</span>
+                    </div>
+                    <div className="flex items-center justify-end gap-2">
+                        <span>ИЗЛУЧЕНИЕ:</span>
+                        <span className={`font-bold ${isFlareHigh ? 'text-red-400' : 'text-green-400'}`}>{currentFlareFlux.toExponential(1)} W/m²</span>
+                    </div>
+                    <div className="text-gray-500 uppercase tracking-wide mt-0.5">
+                        ИНТЕНСИВНОСТЬ: <span className={isFlareHigh ? 'text-yellow-500' : 'text-gray-300'}>{intensityDesc}</span>
+                    </div>
+                </div>
             </div>
-
-             {/* VISUALIZATION */}
-            <SolarFlareMap flareClass={currentFlareClass} flux={currentFlareFlux} />
             
-            {/* --- FLARE CHART --- */}
-            <div className="h-[200px] bg-black/20 rounded border border-white/5 p-2 mb-4">
-               <ResponsiveContainer width="100%" height="100%">
+            {/* SOURCE ANALYSIS ALERTS */}
+            {isCoronalHoleSource && (
+                <div className="mb-3 flex items-center gap-2 bg-orange-900/30 border border-orange-700/50 rounded px-3 py-1.5">
+                    <div className="w-2 h-2 rounded-full bg-orange-500 animate-pulse"></div>
+                    <span className="text-[10px] font-mono text-orange-200 uppercase tracking-wider">
+                        КОРОНАЛЬНАЯ ДЫРА: ВЫСОКОСКОРОСТНОЙ ПОТОК
+                    </span>
+                </div>
+            )}
+            
+            {isCMESource && (
+                <div className="mb-3 flex items-center gap-2 bg-red-900/30 border border-red-700/50 rounded px-3 py-1.5">
+                    <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></div>
+                    <span className="text-[10px] font-mono text-red-200 uppercase tracking-wider">
+                        ВОЗМОЖНЫЙ ВЫБРОС (CME) + ПРОТОННОЕ СОБЫТИЕ
+                    </span>
+                </div>
+            )}
+
+            <SolarFlareMap 
+                flareClass={currentFlareClass} 
+                flux={currentFlareFlux} 
+                windSpeed={currentWind} 
+                isCoronalHoleSource={isCoronalHoleSource}
+                onOpenSdo={() => setIsSDOOpen(true)}
+            />
+
+            <div className="h-[180px] bg-black/20 rounded border border-white/5 p-2 mb-4">
+               <ResponsiveContainer width="100%" height="100%" minWidth={0}>
                 <LineChart data={flareData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(255,255,255,0.1)" />
                   <XAxis 
@@ -448,7 +729,7 @@ const App: React.FC = () => {
                   <RechartsTooltip 
                      contentStyle={{ backgroundColor: '#151a25', borderColor: '#00bcd4', color: '#fff', borderRadius: '4px' }}
                      labelFormatter={(label) => formatTime(label)}
-                     formatter={(value: number, name: string, props: any) => [props.payload.class, 'Класс']}
+                     formatter={(_value: number, _name: string, props: any) => [props.payload.class, 'Класс']}
                   />
                   <YAxis 
                     scale="log" 
@@ -468,7 +749,6 @@ const App: React.FC = () => {
                     dot={false}
                   />
                   
-                  {/* Reference lines */}
                   {detectedFlares.map((flare, index) => {
                       const isActive = activeFlareTime === flare.time;
                       const isSig = flare.isSignificant;
@@ -493,12 +773,11 @@ const App: React.FC = () => {
               </ResponsiveContainer>
             </div>
 
-            {/* --- SIGNIFICANT FLARES LIST (Fixed height) --- */}
-            <div className="h-[350px] flex flex-col bg-black/20 rounded border border-white/5 overflow-hidden">
+            <div className="flex-1 flex flex-col max-h-[200px] bg-black/20 rounded border border-white/5 overflow-hidden">
                 <div className="text-gray-500 p-3 border-b border-gray-800 flex justify-between items-center font-bold text-xs font-mono bg-black/40 rounded-t">
                     <div className="flex items-center gap-2">
                         <span>ЗНАЧИМЫЕ ВСПЫШКИ (КЛАСС C+)</span>
-                        <InfoTooltip title="Список вспышек" description="Список включает только значимые вспышки класса C1.0 и выше за последние 24 часа." />
+                        <InfoTooltip title="Список вспышек" description="Регистрируются только события класса C1.0 и выше, которые выделяются на общем фоне." />
                     </div>
                     <span className="text-[10px] text-gray-600">{significantFlaresList.length} ЗА 24Ч</span>
                 </div>
@@ -531,7 +810,91 @@ const App: React.FC = () => {
                     )}
                 </div>
             </div>
-            
+          </div>
+
+          {/* --- CARD 5: PROTON FLUX --- */}
+          <div className="bg-[#10141e]/90 border border-white/10 rounded-lg p-6 shadow-2xl hover:border-white/30 transition-colors duration-300 flex flex-col">
+            <div className="flex justify-between items-start mb-4">
+              <h3 className="text-gray-400 text-sm font-bold tracking-widest flex items-center gap-2">
+                <Radiation size={16} /> ПРОТОННЫЙ ПОТОК (S-SCALE)
+              </h3>
+              <InfoTooltip 
+                title="Solar Radiation Storms"
+                source="GOES (Protons >10MeV)"
+                description={
+                  <>
+                    <p className="font-bold mb-2 text-white">Интенсивность потока солнечных протонов.</p>
+                    <div className="text-xs space-y-2 text-gray-300">
+                        <p><span className="text-[#00bcd4]">ВАЖНОСТЬ:</span> Критично для спутников (сбои электроники), космонавтов и полярной КВ-радиосвязи.</p>
+                        <p className="border-l-2 border-green-500 pl-2 text-green-100 italic">
+                            <span className="text-green-400 font-bold">ДЛЯ ЧЕЛОВЕКА:</span> На поверхности Земли угрозы НЕ ПРЕДСТАВЛЯЕТ. Атмосфера планеты полностью поглощает и блокирует эти частицы. Вы в безопасности.
+                        </p>
+                    </div>
+                  </>
+                }
+              />
+            </div>
+
+            <div className="flex items-end gap-2 mb-4 border-b border-white/5 pb-4">
+              <span className={`font-mono text-4xl leading-none drop-shadow-md text-white`}>
+                {currentProtonFlux.toExponential(2)}
+              </span>
+              <span className="text-gray-500 text-xs font-mono mb-1">pfu</span>
+              <div className={`ml-auto px-2 py-1 bg-white/10 rounded text-xs font-bold tracking-wider ${protonColor}`}>
+                {protonScale}
+              </div>
+            </div>
+
+            <ProtonGraph flux={currentProtonFlux} />
+
+            <div className="h-[120px] bg-black/20 rounded border border-white/5 p-2 mt-auto">
+                <ResponsiveContainer width="100%" height="100%" minWidth={0}>
+                    <LineChart data={protonData} margin={{ top: 5, right: 5, left: -15, bottom: 0 }}>
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(255,255,255,0.1)" />
+                        <XAxis dataKey="time" tickFormatter={formatTime} tick={{ fill: '#6b7280', fontSize: 10 }} axisLine={false} tickLine={false} minTickGap={30} />
+                        <YAxis scale="log" domain={['auto', 'auto']} tick={{ fill: '#6b7280', fontSize: 10 }} axisLine={false} tickLine={false} />
+                        <RechartsTooltip 
+                            contentStyle={{ backgroundColor: '#151a25', borderColor: '#00bcd4', color: '#fff' }} 
+                            labelFormatter={formatTime}
+                            formatter={(val: number) => [val.toExponential(2), 'Flux']}
+                        />
+                        <Line type="monotone" dataKey="flux" stroke="#00e676" strokeWidth={2} dot={false} />
+                    </LineChart>
+                </ResponsiveContainer>
+            </div>
+          </div>
+
+          {/* --- CARD 6: AURORA FORECAST (BOTTOM) --- */}
+          <div className="bg-[#10141e]/90 border border-white/10 rounded-lg p-6 shadow-2xl hover:border-white/30 transition-colors duration-300 flex flex-col">
+            <div className="flex justify-between items-start mb-4">
+              <h3 className="text-gray-400 text-sm font-bold tracking-widest flex items-center gap-2">
+                <Sparkles size={16} /> AURORA BOREALIS (СИЯНИЯ)
+              </h3>
+              <InfoTooltip 
+                title="Auroral Oval (Овал сияний)"
+                description={
+                  <>
+                    <p>Карта вероятности наблюдения полярных сияний.</p>
+                    <p className="mt-2 text-xs text-gray-400">Овал показывает, где сейчас полярное сияние наиболее интенсивно. Чем шире кольцо и чем оно южнее, тем сильнее буря.</p>
+                  </>
+                }
+              />
+            </div>
+
+            <AuroraMap kp={currentKp} />
+
+            <div className="flex flex-col gap-2 mt-2 text-xs font-mono text-gray-400">
+                <div className="flex justify-between items-center border-b border-white/5 pb-2">
+                    <span>ТЕКУЩИЙ ПРОГНОЗ:</span>
+                    <span className={`font-bold ${currentKp >= 5 ? 'text-[#ff1744]' : 'text-[#00e676]'}`}>
+                        {auroraProbText}
+                    </span>
+                </div>
+                <div className="flex justify-between items-center pt-1">
+                    <span>ЗОНА ВИДИМОСТИ:</span>
+                    <span className="text-white">{auroraLocations}</span>
+                </div>
+            </div>
           </div>
 
         </div>
